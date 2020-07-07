@@ -1,0 +1,2964 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: 'AWS::Serverless-2016-10-31'
+
+Description: >-
+  Shared resources between stacks. This is, resources that are not changed
+  frequently (e.g. networking information, shared databases)
+
+Parameters:
+
+  #############################################################################
+  # Stack Parameters                                                          #
+  #############################################################################
+
+  # Parameter used to define which resources will be created on deploy.
+  # - Production: All resources will be deployed (only in releases)
+  # - Staging: All resources will be deployed (used to test changes on shared resources)
+  # - Development: Only non-shared resources will be deployed
+  Environment:
+    Type: String
+    Description: "Deployment environment of the project. Coordinates which resources are created."
+    Default: "staging"
+    AllowedValues:
+      - "production"
+      - "staging"
+
+  # Used as a reference to get the output from other stacks mainly by
+  # non-shared stacks. This is, if a deployment is on development environment
+  # this referece is used to get the correct values from a deployed stack.
+  ProductionStack:
+    Type: String
+    Default: ""
+    Description: "On a non-production environment, some resources use this value to get variables from other stacks"
+
+  #############################################################################
+  # Resource Parameters                                                       #
+  #############################################################################
+
+  # ECR
+  ProjectVersion:
+    Type: String
+    Description: "Project version, this is, the release tag to be used"
+    AllowedPattern: "^[v]?JUR-[0-9.]+(?:\\w\\d?)?$"
+    ConstraintDescription: "Version needs to be on [v]JUR-X.X.X format"
+
+  # EC2
+  ProjectInstanceAMI:
+    Description: "Project instance's AMI [Default: Amazon Linux 2 (64x SSD)]"
+    Type: AWS::EC2::Image::Id
+    Default: "ami-062f7200baf2fa504"
+
+  ProjectInstanceType:
+    Description: "Project instance's type (e.g. t3.medium, c5.2xlarge)"
+    Type: String
+    Default: "t3.medium"
+
+  AvailabilityZoneName:
+    Description: "Availability Zone to deploy EC2 Resources"
+    Type: AWS::EC2::AvailabilityZone::Name
+
+  EC2KeyPairName:
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Description: "SSH Key-Pair used on EC2 instances"
+
+Conditions:
+  IsProduction: !Equals [ !Ref Environment, "production" ]
+
+Resources:
+
+  #############################################################################
+  # Production Resources                                                      #
+  #############################################################################
+
+  # Amazon S3
+  projectbucket:
+    Type: AWS::S3::Bucket
+    Condition: IsProduction
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: 'True'
+        BlockPublicPolicy: 'True'
+        IgnorePublicAcls: 'True'
+        RestrictPublicBuckets: 'True'
+      Tags:
+        - Key: "Resource"
+          Value: "shared"
+
+  # Amazon S3
+  databucket:
+    Type: AWS::S3::Bucket
+    Condition: IsProduction
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: 'True'
+        BlockPublicPolicy: 'True'
+        IgnorePublicAcls: 'True'
+        RestrictPublicBuckets: 'True'
+      Tags:
+        - Key: "Resource"
+          Value: "shared"
+
+  # DynamoDB
+  historytable:
+    Type: AWS::DynamoDB::Table
+    Condition: IsProduction
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: "id"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "id"
+          KeyType: "HASH"
+      Tags:
+        - Key: "Resource"
+          Value: "shared"
+
+  # Amazon ECR
+  repository:
+    Type: AWS::ECR::Repository
+    Condition: IsProduction
+    Properties:
+      LifecyclePolicy:
+        LifecyclePolicyText: | # Transform to String
+          {
+            "rules": [
+              {
+                "action": { "type": "expire" },
+                "selection": {
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 1,
+                  "tagStatus": "untagged"
+                },
+                "description": "Remove all untagged images",
+                "rulePriority": 1
+              },
+              {
+                "action": {"type": "expire"},
+                "selection": {
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5,
+                  "tagStatus": "tagged",
+                  "tagPrefixList": [ "vJUR-" ]
+                },
+                "description": "Only 5 production images are allowed",
+                "rulePriority": 2
+              },
+              {
+                "action": {"type": "expire"},
+                "selection": {
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10,
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["JUR-"]
+                },
+                "description": "Only 10 development images are allowed",
+                "rulePriority": 3
+              },
+              {
+                "action": { "type": "expire" },
+                "selection": {
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 20,
+                  "tagStatus": "any"
+                },
+                "description": "Remove all other images (!!! THIS NEEDS TO BE THE HIGHEST VALUE !!!)",
+                "rulePriority": 4
+              }
+            ]
+          }
+      Tags:
+        - Key: "Resource"
+          Value: "shared"
+
+  # Amazon EC2: Instances & Volumes
+  projectinstance:
+    Type: AWS::EC2::Instance
+    Condition: IsProduction
+    Properties:
+      ImageId: !Ref ProjectInstanceAMI
+      InstanceType: !Ref ProjectInstanceType
+      AvailabilityZone: !Ref AvailabilityZoneName
+      KeyName: !Ref EC2KeyPairName
+      SecurityGroupIds:
+        - !Ref projectinstancesg
+      SubnetId: !Ref subnet
+      Tags:
+        - Key: "Name"
+          Value: !Sub '${AWS::StackName}-interface'
+        - Key: "Resource"
+          Value: "shared"
+
+  # Amazon EC2: Networking & Security
+  projectinstanceip:
+    Type: AWS::EC2::EIP
+    Condition: IsProduction
+    Properties:
+      Domain: 'vpc'
+      InstanceId: !Ref projectinstance
+
+  projectinstancesg:
+    Type: 'AWS::EC2::SecurityGroup'
+    Condition: IsProduction
+    Properties:
+      VpcId: !Ref vpc
+      GroupDescription: !Sub 'Security group for ${AWS::StackName} project instance'
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: "SSH Connections"
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "HTTP"
+        - IpProtocol: "tcp"
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+          Description: "Django"
+        - IpProtocol: "tcp"
+          FromPort: 5757
+          ToPort: 5757
+          CidrIp: 0.0.0.0/0
+          Description: "Flower"
+        - IpProtocol: "tcp"
+          FromPort: 5858
+          ToPort: 5858
+          CidrIp: 0.0.0.0/0
+          Description: "RabbitMQ"
+      Tags:
+        - Key: "Name"
+          Value: !Sub '${AWS::StackName}-security-group'
+        - Key: "Resource"
+          Value: "shared"
+
+  vpc:
+    Type: 'AWS::EC2::VPC'
+    Condition: IsProduction
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      Tags:
+        - Key: "Name"
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: "Resource"
+          Value: "shared"
+
+  vpcgatewayattachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Condition: IsProduction
+    Properties:
+      VpcId: !Ref vpc
+      InternetGatewayId: !Ref internetgateway
+
+  internetgateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Condition: IsProduction
+    Properties:
+      Tags:
+        - Key: "Name"
+          Value: !Sub '${AWS::StackName}-internet-gateway'
+        - Key: "Resource"
+          Value: "shared"
+
+  subnet:
+    Type: 'AWS::EC2::Subnet'
+    Condition: IsProduction
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZoneName
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref vpc
+      MapPublicIpOnLaunch: 'True'
+      Tags:
+        - Key: "Name"
+          Value: !Sub '${AWS::StackName}-subnet'
+        - Key: "Resource"
+          Value: "shared"
+
+  subnetroutetableassociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: IsProduction
+    Properties:
+      RouteTableId: !Ref routetable
+      SubnetId: !Ref subnet
+
+  routetable:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: IsProduction
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - Key: "Name"
+          Value: !Sub '${AWS::StackName}-route-table'
+        - Key: "Resource"
+          Value: "shared"
+
+  route:
+    Type: 'AWS::EC2::Route'
+    Condition: IsProduction
+    Properties:
+      RouteTableId: !Ref routetable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref internetgateway
+
+  # Amazon Athena: Workgroup
+  jurimetriaworkgroup:
+    Type: AWS::Athena::WorkGroup
+    Condition: IsProduction
+    Properties:
+      Name: !Sub "${AWS::StackName}-workgroup"
+      Description: Jurimetria workgroup
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: True
+        PublishCloudWatchMetricsEnabled: True
+        RequesterPaysEnabled: False
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${databucket}/athena-query-results/"
+
+  # Amazon Glue: Databases
+  jurimetriadatabase:
+    Type: AWS::Glue::Database
+    Condition: IsProduction
+    Properties:
+      DatabaseInput:
+        Name: jurimetriadb
+        Description: Jurimetria database
+      CatalogId: !Ref AWS::AccountId
+
+  # Amazon Glue: Tables
+  processedtable:
+    Type: AWS::Glue::Table
+    DependsOn: jurimetriadatabase
+    Condition: IsProduction
+    Properties:
+      TableInput:
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: True
+          classification: json
+        PartitionKeys:
+          - Name: environment
+            Type: string
+          - Name: collection
+            Type: string
+          - Name: executed_at
+            Type: string
+        StorageDescriptor:
+          StoredAsSubDirectories: False
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Columns:
+            - Name: _id
+              Type: string
+              Comment: from deserializer
+            - Name: numero
+              Type: string
+              Comment: from deserializer
+            - Name: estado
+              Type: string
+              Comment: from deserializer
+            - Name: fonte
+              Type: string
+              Comment: from deserializer
+            - Name: classe_cnj
+              Type: string
+              Comment: from deserializer
+            - Name: classe_cnj_cliente
+              Type: string
+              Comment: from deserializer
+            - Name: instancia
+              Type: string
+              Comment: from deserializer
+            - Name: instancia_cnj
+              Type: string
+              Comment: from deserializer
+            - Name: status
+              Type: string
+              Comment: from deserializer
+            - Name: instancia_tratada
+              Type: string
+              Comment: from deserializer
+            - Name: is_digital
+              Type: string
+              Comment: from deserializer
+            - Name: data_distribuicao_tratada
+              Type: timestamp
+              Comment: from deserializer
+            - Name: ano
+              Type: int
+              Comment: from deserializer
+            - Name: comarca_tratada
+              Type: string
+              Comment: from deserializer
+            - Name: comarca_por_npu
+              Type: string
+              Comment: from deserializer
+            - Name: assuntos
+              Type: string
+              Comment: from deserializer
+            - Name: juiz
+              Type: string
+              Comment: from deserializer
+            - Name: juiz_sentenca
+              Type: string
+              Comment: from deserializer
+            - Name: tipo_sentenca
+              Type: string
+              Comment: from deserializer
+            - Name: sentenca
+              Type: string
+              Comment: from deserializer
+            - Name: data_sentenca_mais_recente
+              Type: timestamp
+              Comment: from deserializer
+            - Name: vara_numero
+              Type: int
+              Comment: from deserializer
+            - Name: vara_tipo
+              Type: string
+              Comment: from deserializer
+            - Name: vara_original
+              Type: string
+              Comment: from deserializer
+            - Name: duracao_acao
+              Type: int
+              Comment: from deserializer
+            - Name: duracao_total
+              Type: int
+              Comment: from deserializer
+            - Name: duracao_primeira_sentenca
+              Type: int
+              Comment: from deserializer
+            - Name: data_distribuicao_por_andamento
+              Type: timestamp
+              Comment: from deserializer
+            - Name: classificacao
+              Type: string
+              Comment: from deserializer
+            - Name: data_arquivamento
+              Type: timestamp
+              Comment: from deserializer
+            - Name: situacao
+              Type: string
+              Comment: from deserializer
+            - Name: auto_penhora
+              Type: string
+              Comment: from deserializer
+            - Name: pre_executividade
+              Type: string
+              Comment: from deserializer
+            - Name: acordo
+              Type: string
+              Comment: from deserializer
+            - Name: deposito_judicial
+              Type: string
+              Comment: from deserializer
+            - Name: resolved_choque
+              Type: string
+              Comment: from deserializer
+            - Name: status_original
+              Type: string
+              Comment: from deserializer
+            - Name: pedido_de_liminar
+              Type: string
+              Comment: from deserializer
+            - Name: data_pedido_liminar
+              Type: timestamp
+              Comment: from deserializer
+            - Name: texto_liminar
+              Type: string
+              Comment: from deserializer
+            - Name: revelia
+              Type: string
+              Comment: from deserializer
+            - Name: data_revelia
+              Type: timestamp
+              Comment: from deserializer
+            - Name: bloqueio
+              Type: string
+              Comment: from deserializer
+            - Name: data_bloqueio
+              Type: timestamp
+              Comment: from deserializer
+            - Name: diferenciador
+              Type: string
+              Comment: from deserializer
+            - Name: transitado_em_julgado
+              Type: string
+              Comment: from deserializer
+            - Name: data_transitado_em_julgado
+              Type: timestamp
+              Comment: from deserializer
+            - Name: valor
+              Type: double
+              Comment: from deserializer
+            - Name: valor_acao_atualizado
+              Type: double
+              Comment: from deserializer
+            - Name: valor_condenacao
+              Type: double
+              Comment: from deserializer
+            - Name: valor_condenacao_moeda
+              Type: string
+              Comment: from deserializer
+            - Name: valor_condenacao_dano_moral
+              Type: double
+              Comment: from deserializer
+            - Name: valor_condenacao_dano_moral_moeda
+              Type: string
+              Comment: from deserializer
+            - Name: valor_acordo
+              Type: double
+              Comment: from deserializer
+            - Name: tempo_inatividade
+              Type: int
+              Comment: from deserializer
+            - Name: numero_processo_stj
+              Type: string
+              Comment: from deserializer
+            - Name: numero_registro_stj
+              Type: string
+              Comment: from deserializer
+            - Name: controle
+              Type: string
+              Comment: from deserializer
+            - Name: tipo_recurso
+              Type: string
+              Comment: from deserializer
+            - Name: uf_origem
+              Type: string
+              Comment: from deserializer
+            - Name: ramo_direito
+              Type: string
+              Comment: from deserializer
+            - Name: tribunal_origem
+              Type: string
+              Comment: from deserializer
+            - Name: andamentos
+              Type: array<struct<titulo:string,fase:string,complemento:string,texto:string,data:timestamp>>
+              Comment: from deserializer
+            - Name: lista_sentenca
+              Type: array<struct<ultima_sentenca:boolean,sentenca:string,data:timestamp,fase:string,texto:string>>
+              Comment: from deserializer
+            - Name: partes
+              Type: array<struct<nome:string,papel:string,papel_mongo:string,polo:string,is_cliente:boolean>>
+              Comment: from deserializer
+            - Name: advogados
+              Type: array<struct<nome:string,nome_final:string,oab:string,pertence_cliente:boolean,escritorio:string>>
+              Comment: from deserializer
+            - Name: peticoes
+              Type: array<struct<numero_protocolo:string,tipo_peticao:string,peticionario:string,data_processamento:timestamp,data_protocolo:timestamp>>
+              Comment: from deserializer
+            - Name: pautas
+              Type: array<struct<data_sessao:timestamp,orgao_julgamento:string>>
+              Comment: from deserializer
+            - Name: tasks
+              Type: array<struct<id:string,created_at:timestamp>>
+              Comment: from deserializer
+            - Name: links
+              Type: array<string>
+              Comment: from deserializer
+            - Name: termos
+              Type: array<string>
+              Comment: from deserializer
+            - Name: termos_cliente
+              Type: array<string>
+              Comment: from deserializer
+            - Name: documentos_metadados
+              Type: array<struct<valor_consulta:string,url:string,file_path:string,meta_path:string,original_name:string,filetype:string,pasta:struct<data:struct<title:string>>,documento:struct<data:struct<title:string>>>>
+              Comment: from deserializer
+          SerdeInfo:
+            Parameters:
+              paths: >-
+                _id,acordo,ano,assuntos,auto_penhora,bloqueio,classe_cnj,
+                classe_cnj_cliente,classificacao,comarca_por_npu,
+                comarca_tratada,data_arquivamento,data_bloqueio,
+                data_distribuicao_por_andamento,data_distribuicao_tratada,
+                data_pedido_liminar,data_revelia,data_sentenca_mais_recente,
+                data_transitado_em_julgado,deposito_judicial,diferenciador,
+                duracao_acao,duracao_primeira_sentenca,duracao_total,estado,
+                fonte,instancia,instancia_cnj,instancia_tratada,is_digital,
+                juiz,juiz_sentenca,numero,numero_processo_stj,
+                numero_registro_stj,controle,pedido_de_liminar,texto_liminar,
+                pre_executividade,ramo_direito,resolved_choque,revelia,
+                sentenca,situacao,status,status_original,tempo_inatividade,
+                tipo_recurso,tipo_sentenca,transitado_em_julgado,
+                tribunal_origem,uf_origem,valor,valor_acao_atualizado,
+                valor_acordo,valor_condenacao,valor_condenacao_moeda,
+                valor_condenacao_dano_moral,valor_condenacao_dano_moral_moeda,
+                vara_numero,vara_original,vara_tipo
+              serialization.format: 1
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          Compressed: False
+          Location: !Sub "s3://${databucket}/processed/"
+        Retention: 0
+        Name: processed
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+
+  # Amazon Glue: Views
+  processosview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: processos
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, estado AS uf, fonte, classe_cnj, classe_cnj_cliente, instancia, instancia_cnj, status, instancia_tratada, is_digital, data_distribuicao_tratada, ano, CAST((CASE WHEN (numero_registro_stj IS NOT NULL) THEN regexp_extract(numero_registro_stj, '^[12]\\d{3}') WHEN (controle IS NOT NULL) THEN regexp_extract(controle, '^[12]\\d{3}') ELSE regexp_extract(numero, '(?<=0{11}\\d{5})[12]\\d{3}|(?<=\\d{9}0)[12]\\d{3}(?=\\d{6})|(?<=\\d{9})[12]\\d{3}(?=\\d{7})') END) AS integer) AS ano_extraido_do_numero, comarca_tratada, comarca_por_npu, assuntos assunto, juiz, juiz_sentenca, tipo_sentenca, sentenca, data_sentenca_mais_recente, vara_numero, vara_tipo, vara_original, duracao_acao, duracao_total, duracao_primeira_sentenca, data_distribuicao_por_andamento, classificacao, data_arquivamento, situacao, auto_penhora, pre_executividade, acordo, deposito_judicial, resolved_choque resolved_cheque, status_original, pedido_de_liminar, data_pedido_liminar, revelia, data_revelia, bloqueio, data_bloqueio, diferenciador, transitado_em_julgado, data_transitado_em_julgado, valor valor_acao, valor_acao_atualizado, valor_condenacao, valor_condenacao_moeda, valor_condenacao_dano_moral, valor_condenacao_dano_moral_moeda, valor_acordo, tempo_inatividade, numero_processo_stj, numero_registro_stj, controle, tipo_recurso, uf_origem, ramo_direito, tribunal_origem, environment, collection, executed_at FROM processed",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "uf",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "fonte",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "classe_cnj",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "classe_cnj_cliente",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "instancia",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "instancia_cnj",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "status",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "instancia_tratada",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "is_digital",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_distribuicao_tratada",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "ano",
+                        "type": "integer"
+                      },
+                      {
+                        "name": "ano_extraido_do_numero",
+                        "type": "integer"
+                      },
+                      {
+                        "name": "comarca_tratada",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "comarca_por_npu",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "assunto",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "juiz",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "juiz_sentenca",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "tipo_sentenca",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "sentenca",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_sentenca_mais_recente",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "vara_numero",
+                        "type": "integer"
+                      },
+                      {
+                        "name": "vara_tipo",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "vara_original",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "duracao_acao",
+                        "type": "integer"
+                      },
+                      {
+                        "name": "duracao_total",
+                        "type": "integer"
+                      },
+                      {
+                        "name": "duracao_primeira_sentenca",
+                        "type": "integer"
+                      },
+                      {
+                        "name": "data_distribuicao_por_andamento",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "classificacao",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_arquivamento",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "situacao",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "auto_penhora",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "pre_executividade",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "acordo",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "deposito_judicial",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "resolved_cheque",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "status_original",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "pedido_de_liminar",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_pedido_liminar",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "revelia",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_revelia",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "bloqueio",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_bloqueio",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "diferenciador",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "transitado_em_julgado",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_transitado_em_julgado",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "valor_acao",
+                        "type": "double"
+                      },
+                      {
+                        "name": "valor_acao_atualizado",
+                        "type": "double"
+                      },
+                      {
+                        "name": "valor_condenacao",
+                        "type": "double"
+                      },
+                      {
+                        "name": "valor_condenacao_moeda",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "valor_condenacao_dano_moral",
+                        "type": "double"
+                      },
+                      {
+                        "name": "valor_condenacao_dano_moral_moeda",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "valor_acordo",
+                        "type": "double"
+                      },
+                      {
+                        "name": "tempo_inatividade",
+                        "type": "integer"
+                      },
+                      {
+                        "name": "numero_processo_stj",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "numero_registro_stj",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "controle",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "tipo_recurso",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "uf_origem",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "ramo_direito",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "tribunal_origem",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: uf
+              Type: string
+            - Name: fonte
+              Type: string
+            - Name: classe_cnj
+              Type: string
+            - Name: classe_cnj_cliente
+              Type: string
+            - Name: instancia
+              Type: string
+            - Name: instancia_cnj
+              Type: string
+            - Name: status
+              Type: string
+            - Name: instancia_tratada
+              Type: string
+            - Name: is_digital
+              Type: string
+            - Name: data_distribuicao_tratada
+              Type: timestamp
+            - Name: ano
+              Type: int
+            - Name: ano_extraido_do_numero
+              Type: int
+            - Name: comarca_tratada
+              Type: string
+            - Name: comarca_por_npu
+              Type: string
+            - Name: assunto
+              Type: string
+            - Name: juiz
+              Type: string
+            - Name: juiz_sentenca
+              Type: string
+            - Name: tipo_sentenca
+              Type: string
+            - Name: sentenca
+              Type: string
+            - Name: data_sentenca_mais_recente
+              Type: timestamp
+            - Name: vara_numero
+              Type: int
+            - Name: vara_tipo
+              Type: string
+            - Name: vara_original
+              Type: string
+            - Name: duracao_acao
+              Type: int
+            - Name: duracao_total
+              Type: int
+            - Name: duracao_primeira_sentenca
+              Type: int
+            - Name: data_distribuicao_por_andamento
+              Type: timestamp
+            - Name: classificacao
+              Type: string
+            - Name: data_arquivamento
+              Type: timestamp
+            - Name: situacao
+              Type: string
+            - Name: auto_penhora
+              Type: string
+            - Name: pre_executividade
+              Type: string
+            - Name: acordo
+              Type: string
+            - Name: deposito_judicial
+              Type: string
+            - Name: resolved_cheque
+              Type: string
+            - Name: status_original
+              Type: string
+            - Name: pedido_de_liminar
+              Type: string
+            - Name: data_pedido_liminar
+              Type: timestamp
+            - Name: revelia
+              Type: string
+            - Name: data_revelia
+              Type: timestamp
+            - Name: bloqueio
+              Type: string
+            - Name: data_bloqueio
+              Type: timestamp
+            - Name: diferenciador
+              Type: string
+            - Name: transitado_em_julgado
+              Type: string
+            - Name: data_transitado_em_julgado
+              Type: timestamp
+            - Name: valor_acao
+              Type: double
+            - Name: valor_acao_atualizado
+              Type: double
+            - Name: valor_condenacao
+              Type: double
+            - Name: valor_condenacao_moeda
+              Type: string
+            - Name: valor_condenacao_dano_moral
+              Type: double
+            - Name: valor_condenacao_dano_moral_moeda
+              Type: string
+            - Name: valor_acordo
+              Type: double
+            - Name: tempo_inatividade
+              Type: int
+            - Name: numero_processo_stj
+              Type: string
+            - Name: numero_registro_stj
+              Type: string
+            - Name: controle
+              Type: string
+            - Name: tipo_recurso
+              Type: string
+            - Name: uf_origem
+              Type: string
+            - Name: ramo_direito
+              Type: string
+            - Name: tribunal_origem
+              Type: string
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  andamentosview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: andamentos
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, andamentos_table.titulo AS titulo, andamentos_table.fase AS fase, andamentos_table.complemento AS complemento, andamentos_table.texto AS texto, andamentos_table.data AS data, environment, collection, executed_at FROM processed CROSS JOIN UNNEST(andamentos) t (andamentos_table)",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "titulo",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "fase",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "complemento",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "texto",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: titulo
+              Type: string
+            - Name: fase
+              Type: string
+            - Name: complemento
+              Type: string
+            - Name: texto
+              Type: string
+            - Name: data
+              Type: timestamp
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  sentencasview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: sentencas
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, sentencas_table.ultima_sentenca AS ultima_sentenca, sentencas_table.sentenca AS sentenca, sentencas_table.data AS data_sentenca, sentencas_table.fase AS fase, sentencas_table.texto AS texto_sentenca, environment, collection, executed_at FROM processed CROSS JOIN UNNEST(lista_sentenca) t (sentencas_table)",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "ultima_sentenca",
+                        "type": "boolean"
+                      },
+                      {
+                        "name": "sentenca",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_sentenca",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "fase",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "texto_sentenca",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: ultima_sentenca
+              Type: boolean
+            - Name: sentenca
+              Type: string
+            - Name: data_sentenca
+              Type: timestamp
+            - Name: fase
+              Type: string
+            - Name: texto_sentenca
+              Type: string
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  advogadosview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: advogados
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, advogados_table.nome AS nome, advogados_table.nome_final AS nome_final, advogados_table.oab AS oab, advogados_table.pertence_cliente AS pertence_cliente, advogados_table.escritorio AS escritorio, environment, collection, executed_at FROM processed CROSS JOIN UNNEST(advogados) t (advogados_table)",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "nome",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "nome_final",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "oab",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "pertence_cliente",
+                        "type": "boolean"
+                      },
+                      {
+                        "name": "escritorio",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: nome
+              Type: string
+            - Name: nome_final
+              Type: string
+            - Name: oab
+              Type: string
+            - Name: pertence_cliente
+              Type: boolean
+            - Name: escritorio
+              Type: string
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  assuntosview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: assuntos
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, assuntos AS assunto, environment, collection, executed_at FROM processed",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "assunto",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: assunto
+              Type: string
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  linksview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: links
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, link_field AS link, environment, collection, executed_at FROM processed CROSS JOIN UNNEST(links) t (link_field)",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "link",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: link
+              Type: string
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  partesview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: partes
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, estado AS uf, comarca_tratada, status, instancia_tratada, data_sentenca_mais_recente, tipo_sentenca, data_distribuicao_tratada, vara_numero, vara_tipo, vara_original, partes_table.nome AS nome_parte, partes_table.papel AS papel, partes_table.papel_mongo AS papel_mongo, partes_table.polo AS polo, partes_table.is_cliente AS is_cliente, environment, collection, executed_at FROM processed CROSS JOIN UNNEST(partes) t (partes_table)",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "uf",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "comarca_tratada",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "status",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "instancia_tratada",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_sentenca_mais_recente",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "tipo_sentenca",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_distribuicao_tratada",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "vara_numero",
+                        "type": "integer"
+                      },
+                      {
+                        "name": "vara_tipo",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "vara_original",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "nome_parte",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "papel",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "papel_mongo",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "polo",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "is_cliente",
+                        "type": "boolean"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: uf
+              Type: string
+            - Name: comarca_tratada
+              Type: string
+            - Name: status
+              Type: string
+            - Name: instancia_tratada
+              Type: string
+            - Name: data_sentenca_mais_recente
+              Type: timestamp
+            - Name: tipo_sentenca
+              Type: string
+            - Name: data_distribuicao_tratada
+              Type: timestamp
+            - Name: vara_numero
+              Type: int
+            - Name: vara_tipo
+              Type: string
+            - Name: vara_original
+              Type: string
+            - Name: nome_parte
+              Type: string
+            - Name: papel
+              Type: string
+            - Name: papel_mongo
+              Type: string
+            - Name: polo
+              Type: string
+            - Name: is_cliente
+              Type: boolean
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  pautasview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: pautas
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, pautas_table.data_sessao AS data_sessao, pautas_table.orgao_julgamento AS orgao_julgamento, environment, collection, executed_at FROM processed CROSS JOIN UNNEST(pautas) t (pautas_table)",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_sessao",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "orgao_julgamento",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: data_sessao
+              Type: timestamp
+            - Name: orgao_julgamento
+              Type: string
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  peticoesview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: peticoes
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, peticoes_table.numero_protocolo AS numero_protocolo, peticoes_table.tipo_peticao AS tipo_peticao, peticoes_table.peticionario AS peticionario, peticoes_table.data_processamento AS data_processamento, peticoes_table.data_protocolo AS data_protocolo, environment, collection, executed_at FROM processed CROSS JOIN UNNEST(peticoes) t (peticoes_table)",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "numero_protocolo",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "tipo_peticao",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "peticionario",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_processamento",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "data_protocolo",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: numero_protocolo
+              Type: string
+            - Name: tipo_peticao
+              Type: string
+            - Name: peticionario
+              Type: string
+            - Name: data_processamento
+              Type: timestamp
+            - Name: data_protocolo
+              Type: timestamp
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  tasksview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: tasks
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, tasks_table.id AS task_id, tasks_table.created_at AS data, environment, collection, executed_at FROM processed CROSS JOIN UNNEST(tasks) t (tasks_table)",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "task_id",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: task_id
+              Type: string
+            - Name: data
+              Type: timestamp
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  termosview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: termos
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, termo_field AS termo, environment, collection, executed_at FROM processed CROSS JOIN UNNEST(termos) t (termo_field)",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "termo",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: termo
+              Type: string
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  termosclienteview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: termos_cliente
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, termo_cliente_field AS termo_cliente, environment, collection, executed_at FROM processed CROSS JOIN UNNEST(termos_cliente) t (termo_cliente_field)",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "termo_cliente",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: termo_cliente
+              Type: string
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  valoresview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: valores
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, valor AS valor_acao, valor_acao_atualizado, valor_condenacao, valor_condenacao_moeda, valor_condenacao_dano_moral, valor_condenacao_dano_moral_moeda, valor_acordo, environment, collection, executed_at FROM processed",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "valor_acao",
+                        "type": "double"
+                      },
+                      {
+                        "name": "valor_acao_atualizado",
+                        "type": "double"
+                      },
+                      {
+                        "name": "valor_condenacao",
+                        "type": "double"
+                      },
+                      {
+                        "name": "valor_condenacao_moeda",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "valor_condenacao_dano_moral",
+                        "type": "double"
+                      },
+                      {
+                        "name": "valor_condenacao_dano_moral_moeda",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "valor_acordo",
+                        "type": "double"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: valor_acao
+              Type: double
+            - Name: valor_acao_atualizado
+              Type: double
+            - Name: valor_condenacao
+              Type: double
+            - Name: valor_condenacao_moeda
+              Type: string
+            - Name: valor_condenacao_dano_moral
+              Type: double
+            - Name: valor_condenacao_dano_moral_moeda
+              Type: string
+            - Name: valor_acordo
+              Type: double
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  liminarview:
+    Type: AWS::Glue::Table
+    DependsOn: processedtable
+    Condition: IsProduction
+    Properties:
+      DatabaseName: !Ref jurimetriadatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: liminar
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: True
+        PartitionKeys: []
+        ViewOriginalText:
+          Fn::Join:
+            - ''
+            - - '/* Presto View: '
+              - Fn::Base64: !Sub
+                - |
+                  {
+                    "originalSql": "SELECT numero, _id AS processo_mongoid, pedido_de_liminar, data_pedido_liminar, texto_liminar, environment, collection, executed_at FROM processed",
+                    "catalog": "awsdatacatalog",
+                    "schema": "${DatabaseName}",
+                    "columns": [
+                      {
+                        "name": "numero",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "processo_mongoid",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "pedido_de_liminar",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "data_pedido_liminar",
+                        "type": "timestamp"
+                      },
+                      {
+                        "name": "texto_liminar",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "environment",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "collection",
+                        "type": "varchar"
+                      },
+                      {
+                        "name": "executed_at",
+                        "type": "varchar"
+                      }
+                    ]
+                  }
+                - {
+                  DatabaseName: !Ref jurimetriadatabase
+                }
+              - ' */'
+        ViewExpandedText: '/* Presto View */'
+        StorageDescriptor:
+          SerdeInfo: {}
+          Columns:
+            - Name: numero
+              Type: string
+            - Name: processo_mongoid
+              Type: string
+            - Name: pedido_de_liminar
+              Type: string
+            - Name: data_pedido_liminar
+              Type: timestamp
+            - Name: texto_liminar
+              Type: string
+            - Name: environment
+              Type: string
+            - Name: collection
+              Type: string
+            - Name: executed_at
+              Type: string
+
+  #############################################################################
+  # Staging Resources                                                         #
+  #############################################################################
+
+  # Step Functions: Resources
+  jurimetriastatemachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineType: STANDARD
+      DefinitionString:
+        !Sub # Esse snippet é usado para ser substitúido dinamicamente pelo script
+          - |
+          ##{{STATEMACHINE_DEF}}
+          - {
+              SetupLambdaFunctionArn: !GetAtt setupfunction.Arn,
+              EndLambdaFunctionArn: !GetAtt endfunction.Arn,
+              AthenaVerifyLambdaFunctionArn: !GetAtt athenaverifyfunction.Arn,
+              AthenaUpdateLambdaFunctionArn: !GetAtt athenaupdatefunction.Arn
+            }
+      RoleArn: !GetAtt stepfunctionrole.Arn
+      Tags:
+        - Key: "Resource"
+          Value: "main"
+
+  # Step Functions: Access Management (IAM)
+  stepfunctionrole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "Lambda"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt setupfunction.Arn
+                  - !GetAtt endfunction.Arn
+                  - !GetAtt athenaupdatefunction.Arn
+                  - !GetAtt athenaverifyfunction.Arn
+        - PolicyName: "Batch"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "batch:SubmitJob"
+                Resource:
+                  - !Ref jurimetriaprocessing
+                  - !Ref jurimetriapersistence
+                  - !Ref jurimetriaqueue
+              - Effect: Allow
+                Action:
+                  - "batch:TerminateJob"
+                  - "batch:DescribeJobs"
+                Resource: "*" # IAM does not support resource-level permissions for this actions (https://docs.aws.amazon.com/batch/latest/userguide/batch-supported-iam-actions-resources.html)
+        - PolicyName: "CloudwatchEvent"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              Effect: "Allow"
+              Action:
+                - "events:PutTargets"
+                - "events:PutRule"
+                - "events:DescribeRule"
+              Resource:
+                !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForBatchJobsRule"
+      Tags:
+        - Key: "Resource"
+          Value: "main"
+
+  # Lambda: Resources
+  setupfunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Description: "Setup Lambda Function"
+      Role: !GetAtt lambdarole.Arn
+      CodeUri: ../../awslambda/src/setup
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 60
+      Environment:
+          Variables:
+            PROJECT_VERSION: !Ref ProjectVersion
+            ENVIRONMENT: !Ref Environment
+            MONGO_URL: '{{resolve:secretsmanager:jurimetria-production-secrets:SecretString:production_mongo_url}}'
+            MONGO_DB: 'tribunais'
+            CHUNK_SIZE: '10000'
+            JOB_DEFINITION_PROCESSING: !Ref jurimetriaprocessing
+            JOB_DEFINITION_PERSISTENCE: !Ref jurimetriapersistence
+            JOB_QUEUE: !Ref jurimetriaqueue
+            HISTORY_TABLE:
+              Fn::If:
+              - IsProduction
+              - !Ref historytable
+              - Fn::ImportValue:
+                  !Sub "${ProductionStack}:HistoryTable"
+            S3_DATA_BUCKET:
+              Fn::If:
+                - IsProduction
+                - !Ref databucket
+                - Fn::ImportValue:
+                    !Sub "${ProductionStack}:DataBucket"
+      Tags: {
+        "Resource": "main"
+      }
+
+  endfunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Description: "End Lambda Function"
+      Role: !GetAtt lambdarole.Arn
+      CodeUri: ../../awslambda/src/end
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 3
+      Environment:
+        Variables:
+          HISTORY_TABLE:
+            Fn::If:
+              - IsProduction
+              - !Ref historytable
+              - Fn::ImportValue:
+                  !Sub "${ProductionStack}:HistoryTable"
+      Tags: {
+        "Resource": "main"
+      }
+
+  athenaupdatefunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Description: "Athena Lambda Function"
+      Role: !GetAtt lambdarole.Arn
+      CodeUri: ../../awslambda/src/athena_update
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 3
+      Environment:
+        Variables:
+          ATHENA_WORKGROUP:
+            Fn::If:
+              - IsProduction
+              - !Ref jurimetriaworkgroup
+              - Fn::ImportValue:
+                  !Sub "${ProductionStack}:JurimetriaWorkgroup"
+          ATHENA_DATABASE:
+            Fn::If:
+              - IsProduction
+              - !Ref jurimetriadatabase
+              - Fn::ImportValue:
+                  !Sub "${ProductionStack}:JurimetriaDatabase"
+          ATHENA_TABLE: processed
+      Tags: {
+        "Resource": "main"
+      }
+
+  athenaverifyfunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Description: "Athena Lambda Function"
+      Role: !GetAtt lambdarole.Arn
+      CodeUri: ../../awslambda/src/athena_verify_status
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 3
+      Tags: {
+        "Resource": "main"
+      }
+
+  # Lambda: Access Management (IAM)
+  lambdarole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: "DynamoDB"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:Query"
+                Resource:
+                  - Fn::If:
+                    - IsProduction
+                    - !GetAtt historytable.Arn
+                    - Fn::ImportValue:
+                        !Sub "${ProductionStack}:HistoryTableArn"
+                  - Fn::If:
+                    - IsProduction
+                    - !Join [ "/" , [ !GetAtt historytable.Arn, "index", "collection-executed_at-index" ] ]
+                    - Fn::Join:
+                      - "/"
+                      - - Fn::ImportValue:
+                            !Sub "${ProductionStack}:HistoryTableArn"
+                        - "index"
+                        - "collection-executed_at-index"
+        - PolicyName: "Athena"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "athena:StartQueryExecution"
+                  - "athena:GetQueryExecution"
+                Resource:
+                  Fn::Sub:
+                    - "arn:aws:athena:*:*:workgroup/${AthenaWorkgroup}"
+                    - AthenaWorkgroup:
+                        Fn::If:
+                          - IsProduction
+                          - !Ref jurimetriaworkgroup
+                          - Fn::ImportValue:
+                              !Sub "${ProductionStack}:JurimetriaWorkgroup"
+        - PolicyName: "S3"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:ListMultipartUploadParts"
+                  - "s3:AbortMultipartUpload"
+                  - "s3:CreateBucket"
+                  - "s3:PutObject"
+                Resource:
+                  - Fn::If:
+                    - IsProduction
+                    - !GetAtt databucket.Arn
+                    - Fn::ImportValue:
+                        !Sub "${ProductionStack}:DataBucketArn"
+                  - Fn::Sub:
+                    - '${DATABUCKETARN}/*'
+                    - DATABUCKETARN:
+                        Fn::If:
+                          - IsProduction
+                          - !GetAtt databucket.Arn
+                          - Fn::ImportValue:
+                              !Sub "${ProductionStack}:DataBucketArn"
+        - PolicyName: "Glue"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "glue:SearchTables"
+                  - "glue:GetPartition"
+                  - "glue:GetTableVersion"
+                  - "glue:GetTable"
+                  - "glue:GetTables"
+                  - "glue:GetTableVersions"
+                  - "glue:GetDatabase"
+                  - "glue:BatchCreatePartition"
+                  - "glue:CreatePartition"
+                  - "glue:DeletePartition"
+                  - "glue:BatchDeletePartition"
+                  - "glue:UpdatePartition"
+                  - "glue:GetPartition"
+                  - "glue:GetPartitions"
+                  - "glue:BatchGetPartition"
+                Resource: "*"
+        - PolicyName: "Batch"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "batch:DescribeJobs"
+                  - "batch:ListJobs"
+                Resource: "*"
+
+  # AWS Batch: Compute Environment
+  jurimetriace:
+    Type: 'AWS::Batch::ComputeEnvironment'
+    Properties:
+      ServiceRole: !Ref batchservicerole
+      Type: MANAGED
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        DesiredvCpus: 0
+        MaxvCpus: 2048
+        InstanceTypes:
+          - c5.2xlarge
+        Subnets:
+          - Fn::If:
+            - IsProduction
+            - !Ref subnet
+            - Fn::ImportValue:
+                !Sub "${ProductionStack}:Subnet"
+        SecurityGroupIds:
+          - !Ref jurimetriacesg
+        InstanceRole: !Ref iaminstanceprofile
+        Tags: { # Some tags hard-coded because compute environment does not propagate stack tags
+          "Name" : !Sub '${AWS::StackName}-batch',
+          "Resource": "main",
+          "Environment": !Ref Environment,
+          "Project": jurimetria,
+          "Team": etl
+        }
+
+  # AWS Batch: Queues
+  jurimetriaqueue:
+    Type: 'AWS::Batch::JobQueue'
+    Properties:
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref jurimetriace
+
+
+  # AWS Batch: Job Definitions
+  jurimetriaprocessing:
+    Type: 'AWS::Batch::JobDefinition'
+    UpdateReplacePolicy: Retain
+    Properties:
+      Type: container
+      Timeout:
+        AttemptDurationSeconds: 86400  # 24 hours
+      ContainerProperties:
+        JobRoleArn: !GetAtt ecstaskrole.Arn
+        Vcpus: 8
+        Memory: 15000
+        Image:
+          Fn::Sub:
+            - '${ACCOUNTID}.dkr.ecr.${REGION}.amazonaws.com/${REPOSITORY}:${IMAGETAG}'
+            - ACCOUNTID: !Ref AWS::AccountId
+              REGION: !Ref AWS::Region
+              IMAGETAG: !Ref ProjectVersion
+              REPOSITORY:
+                Fn::If:
+                  - IsProduction
+                  - !Ref repository
+                  - Fn::ImportValue:
+                      !Sub "${ProductionStack}:Repository"
+        Command:
+          - poetry
+          - run
+          - python
+          - pipeline/transform/run.py
+        Environment:
+          - Name: "SENTRY_DSN"
+            Value: '{{resolve:secretsmanager:jurimetria-production-secrets:SecretString:sentry_dsn}}'
+          - Name: "ENVIRONMENT"
+            Value: !Ref Environment
+          - Name: "MONGODB_URL"
+            Value: '{{resolve:secretsmanager:jurimetria-production-secrets:SecretString:production_mongo_url}}'
+          - Name: "CLIENTS_DATABASE_URL"
+            Value: !Join [ '/', [ '{{resolve:secretsmanager:jurimetria-production-secrets:SecretString:production_postgres_url}}', 'django-etl-pipelines' ] ]
+          - Name: "AWS_DEFAULT_REGION"
+            Value: !Ref AWS::Region
+          - Name: "S3_PROJECT_BUCKET"
+            Value:
+              Fn::If:
+                - IsProduction
+                - !Ref projectbucket
+                - Fn::ImportValue:
+                    !Sub "${ProductionStack}:ProjectBucket"
+      RetryStrategy:
+        Attempts: 1
+
+  jurimetriapersistence:
+    Type: 'AWS::Batch::JobDefinition'
+    UpdateReplacePolicy: Retain
+    Properties:
+      Type: container
+      Timeout:
+        AttemptDurationSeconds: 86400  # 24 hours
+      ContainerProperties:
+        JobRoleArn: !GetAtt ecstaskrole.Arn
+        Vcpus: 8
+        Memory: 15000
+        Image:
+          Fn::Sub:
+            - '${ACCOUNTID}.dkr.ecr.${REGION}.amazonaws.com/${REPOSITORY}:${IMAGETAG}'
+            - ACCOUNTID: !Ref AWS::AccountId
+              REGION: !Ref AWS::Region
+              IMAGETAG: !Ref ProjectVersion
+              REPOSITORY:
+                Fn::If:
+                  - IsProduction
+                  - !Ref repository
+                  - Fn::ImportValue:
+                      !Sub "${ProductionStack}:Repository"
+        Command:
+          - poetry
+          - run
+          - python
+          - pipeline/persistence/run.py
+        Environment:
+          - Name: "POSTGRES_URL"
+            Value: '{{resolve:secretsmanager:jurimetria-production-secrets:SecretString:production_postgres_url}}'
+          - Name: "ATHENA_SCHEMA_NAME"
+            Value:
+              Fn::If:
+                - IsProduction
+                - !Ref jurimetriadatabase
+                - Fn::ImportValue:
+                    !Sub "${ProductionStack}:JurimetriaDatabase"
+          - Name: "ATHENA_WORKGROUP"
+            Value:
+              Fn::If:
+                - IsProduction
+                - !Ref jurimetriaworkgroup
+                - Fn::ImportValue:
+                    !Sub "${ProductionStack}:JurimetriaWorkgroup"
+          - Name: "OVERWRITE_POSTGRES_DATABASE"
+            Value: "True"
+          - Name: "ATHENA_S3_STAGING_DIR"
+            Value:
+              Fn::Sub:
+                - 's3://${DATABUCKET}/athena-query-results/'
+                - DATABUCKET:
+                    Fn::If:
+                      - IsProduction
+                      - !Ref databucket
+                      - Fn::ImportValue:
+                          !Sub "${ProductionStack}:DataBucket"
+          - Name: "AWS_DEFAULT_REGION"
+            Value: !Ref AWS::Region
+      RetryStrategy:
+        Attempts: 1
+
+  # AWS Batch: Networking
+  jurimetriacesg:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId:
+        Fn::If:
+          - IsProduction
+          - !Ref vpc
+          - Fn::ImportValue:
+              !Sub "${ProductionStack}:VPC"
+      GroupDescription: !Sub 'Security group for ${AWS::StackName} project compute environment'
+      Tags:
+        - Key: "Name"
+          Value: !Sub '${AWS::StackName}-ce-sg'
+        - Key: "Resource"
+          Value: "main"
+
+  # AWS Batch: Access Management (IAM)
+  batchservicerole:
+    Type: 'AWS::IAM::Role'
+    Description: "Allows Batch to create and manage AWS resources on your behalf"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole'
+      Tags:
+        - Key: "Resource"
+          Value: "main"
+
+  ecsinstancerole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+      Tags:
+        - Key: "Resource"
+          Value: "main"
+
+  iaminstanceprofile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref ecsinstancerole
+
+  ecstaskrole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Description: "Permission for Batch jobs (ECS Tasks) to run on resources"
+      AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: ''
+              Effect: Allow
+              Principal:
+                Service: ecs-tasks.amazonaws.com
+              Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: "AWSCloudwatch"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:CreateLogGroup"
+                  - "logs:PutLogEvents"
+                Resource: '*'
+        - PolicyName: "AmazonS3"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:PutObjectVersionTagging"
+                  - "s3:GetObjectTagging"
+                  - "s3:ListBucket"
+                  - "s3:PutObjectTagging"
+                  - "s3:DeleteObject"
+                  - "s3:ListMultipartUploadParts"
+                Resource:
+                  - Fn::If:
+                    - IsProduction
+                    - !GetAtt databucket.Arn
+                    - Fn::ImportValue:
+                        !Sub "${ProductionStack}:DataBucketArn"
+                  - Fn::Sub:
+                    - '${DATABUCKETARN}/*'
+                    - DATABUCKETARN:
+                        Fn::If:
+                          - IsProduction
+                          - !GetAtt databucket.Arn
+                          - Fn::ImportValue:
+                              !Sub "${ProductionStack}:DataBucketArn"
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectTagging"
+                  - "s3:ListBucket"
+                Resource:
+                  - Fn::If:
+                    - IsProduction
+                    - !GetAtt projectbucket.Arn
+                    - Fn::ImportValue:
+                        !Sub "${ProductionStack}:ProjectBucketArn"
+                  - Fn::Sub:
+                    - '${PROJECTBUCKETARN}/*'
+                    - PROJECTBUCKETARN:
+                        Fn::If:
+                          - IsProduction
+                          - !GetAtt projectbucket.Arn
+                          - Fn::ImportValue:
+                              !Sub "${ProductionStack}:ProjectBucketArn"
+        - PolicyName: "Glue"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                - "glue:SearchTables"
+                - "glue:GetConnections"
+                - "glue:GetTables"
+                - "glue:GetTableVersions"
+                - "glue:GetPartitions"
+                - "glue:DeleteTableVersion"
+                - "glue:BatchGetPartition"
+                - "glue:GetDatabases"
+                - "glue:GetTable"
+                - "glue:GetDatabase"
+                - "glue:GetPartition"
+                - "glue:GetTableVersion"
+                - "glue:GetConnection"
+                - "glue:BatchDeleteTableVersion"
+                Resource: '*'
+        - PolicyName: "AWSAthena"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "athena:StartQueryExecution"
+                  - "athena:GetQueryResultsStream"
+                  - "athena:GetQueryResults"
+                  - "athena:GetNamedQuery"
+                  - "athena:ListTagsForResource"
+                  - "athena:ListQueryExecutions"
+                  - "athena:ListNamedQueries"
+                  - "athena:GetWorkGroup"
+                  - "athena:CancelQueryExecution"
+                  - "athena:GetQueryExecution"
+                  - "athena:StopQueryExecution"
+                  - "athena:BatchGetNamedQuery"
+                  - "athena:BatchGetQueryExecution"
+                Resource:
+                  Fn::Sub:
+                    - "arn:aws:athena:*:*:workgroup/${AthenaWorkgroup}"
+                    - AthenaWorkgroup:
+                        Fn::If:
+                          - IsProduction
+                          - !Ref jurimetriaworkgroup
+                          - Fn::ImportValue:
+                              !Sub "${ProductionStack}:JurimetriaWorkgroup"
+              - Effect: Allow
+                Action:
+                  - "athena:GetNamespaces"
+                  - "athena:GetExecutionEngine"
+                  - "athena:GetNamespace"
+                  - "athena:GetExecutionEngines"
+                  - "athena:GetQueryExecutions"
+                  - "athena:GetTables"
+                  - "athena:GetTable"
+                  - "athena:ListWorkGroups"
+                  - "athena:RunQuery"
+                  - "athena:GetCatalogs"
+                Resource: "*"
+      Tags:
+        - Key: "Resource"
+          Value: "main"
+
+Outputs:
+  # ATTENTION: Since export values needs to be unique over AWS account and
+  # for easy reference between deployments it is REQUIRED for an exported value
+  # name to be composed by 'AWS::StackName'
+
+  # S3
+  ProjectBucketArn:
+    Description: "Project's Bucket Arn"
+    Value:
+      Fn::If:
+        - IsProduction
+        - !GetAtt projectbucket.Arn
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:ProjectBucketArn"
+    Export:
+      Name: !Sub '${AWS::StackName}:ProjectBucketArn'
+  ProjectBucket:
+    Description: "Project's Bucket"
+    Value:
+      Fn::If:
+        - IsProduction
+        - !Ref projectbucket
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:ProjectBucket"
+    Export:
+      Name: !Sub '${AWS::StackName}:ProjectBucket'
+
+  DataBucketArn:
+    Description: "Data Bucket Arn"
+    Value:
+      Fn::If:
+        - IsProduction
+        - !GetAtt databucket.Arn
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:DataBucketArn"
+    Export:
+      Name: !Sub '${AWS::StackName}:DataBucketArn'
+  DataBucket:
+    Description: "Data Bucket"
+    Value:
+      Fn::If:
+        - IsProduction
+        - !Ref databucket
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:DataBucket"
+    Export:
+      Name: !Sub '${AWS::StackName}:DataBucket'
+
+  # DynamoDB
+  HistoryTable:
+    Description: "History DynamoDB Table"
+    Value:
+      Fn::If:
+        - IsProduction
+        - !Ref historytable
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:HistoryTable"
+    Export:
+      Name: !Sub '${AWS::StackName}:HistoryTable'
+  HistoryTableArn:
+    Description: "History DynamoDB Table Arn"
+    Value:
+      Fn::If:
+        - IsProduction
+        - !GetAtt historytable.Arn
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:HistoryTableArn"
+    Export:
+      Name: !Sub '${AWS::StackName}:HistoryTableArn'
+
+  # ECR
+  Repository:
+    Description: "Batch Images Repository (ECR)"
+    Value:
+      Fn::If:
+        - IsProduction
+        - !Ref repository
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:Repository"
+    Export:
+      Name: !Sub '${AWS::StackName}:Repository'
+
+  # Network and Security
+  Subnet:
+    Description: "Project's Subnet"
+    Value:
+      Fn::If:
+        - IsProduction
+        - !Ref subnet
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:Subnet"
+    Export:
+      Name: !Sub '${AWS::StackName}:Subnet'
+  VPC:
+    Description: "Project's VPC"
+    Value:
+      Fn::If:
+        - IsProduction
+        - !Ref vpc
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:VPC"
+    Export:
+      Name: !Sub '${AWS::StackName}:VPC'
+
+  # Athena Workgroup
+  JurimetriaWorkgroup:
+    Description: Jurimetria workgroup
+    Value:
+      Fn::If:
+        - IsProduction
+        - !Ref jurimetriaworkgroup
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:JurimetriaWorkgroup"
+    Export:
+      Name: !Sub '${AWS::StackName}:JurimetriaWorkgroup'
+
+  # Database
+  JurimetriaDatabase:
+    Description: Jurimetria database
+    Value:
+      Fn::If:
+        - IsProduction
+        - !Ref jurimetriadatabase
+        - Fn::ImportValue:
+            !Sub "${ProductionStack}:JurimetriaDatabase"
+    Export:
+      Name: !Sub '${AWS::StackName}:JurimetriaDatabase'

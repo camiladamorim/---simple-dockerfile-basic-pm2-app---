@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >-
+  This template contains all resources used for the team but are not part
+  of the application. Examples are ec2 instances and volumes to run experiments
+  or long running scripts.
+
+Parameters:
+
+  ProjectName:
+    Description: "Team name for tagging and naming"
+    Type: String
+
+  AvailabilityZoneName:
+    Description: "Availability Zone to deploy EC2 instances"
+    Type: AWS::EC2::AvailabilityZone::Name
+
+  ExperimentsInstanceAMI:
+    Description: "AMI for the experiments instance. Vary with region. Default: Amazon Linux 2 (64x - SSD)"
+    Type: AWS::EC2::Image::Id
+    Default: "ami-02ccb28830b645a41"
+
+  ExperimentsInstanceType:
+    Description: "Type of instance. (e.g. t3a.medium)"
+    Type: String
+    Default: "t3a.medium"
+
+  EC2KeyPairName:
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Description: "Key-pair for SSH connection on EC2 instances"
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: "VPC for Experiments EC2 instance"
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Subnet for Experiments EC2 instance"
+
+Resources:
+
+  ############################################################################
+  # Amazon EC2                                                               #
+  ############################################################################
+
+  # Instances & Volumes
+  experimentsvolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: 50
+      AvailabilityZone: !Ref AvailabilityZoneName
+      Tags:
+        - Key: "Name"
+          Value: !Sub '${ProjectName}-volume'
+        - Key: "Resource"
+          Value: "extra"
+
+  experimentsinstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ExperimentsInstanceAMI
+      InstanceType: !Ref ExperimentsInstanceType
+      IamInstanceProfile: !Ref experimentsinstanceprofile
+      AvailabilityZone: !Ref AvailabilityZoneName
+      KeyName: !Ref EC2KeyPairName
+      Volumes:
+        -
+          VolumeId: !Ref experimentsvolume
+          Device: /dev/sdk
+      SecurityGroupIds:
+        - !Ref securitygroup
+      SubnetId: !Ref SubnetId
+      Tags:
+        - Key: "Name"
+          Value: !Sub '${ProjectName}-experiments-instance'
+        - Key: "Resource"
+          Value: "extra"
+
+  # Networking & Security
+  securitygroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VPCId
+      GroupDescription: !Sub 'Security group for ${ProjectName} experiments instance'
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: "SSH Connections"
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "HTTP"
+        - IpProtocol: "tcp"
+          FromPort: 8888
+          ToPort: 8888
+          CidrIp: 0.0.0.0/0
+          Description: "Jupyter notebook"
+        - IpProtocol: "tcp"
+          FromPort: 2376
+          ToPort: 2376
+          CidrIp: 0.0.0.0/0
+          Description: "Docker"
+      Tags:
+        - Key: "Resource"
+          Value: "extra"
+
+  # IAM
+  experimentsiamrole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Description: "Permission for Batch jobs (ECS Tasks) to run on resources"
+      AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            -
+              Effect: "Allow"
+              Principal:
+                Service:
+                  - "ec2.amazonaws.com"
+              Action:
+                - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "S3"
+          PolicyDocument: {
+            "Version": "2012-10-17",
+            "Statement": {
+              "Effect": "Allow",
+              "Action": [
+                "s3:*"
+              ],
+              "Resource": [
+                "mudar"
+              ]
+            }
+          }
+        - PolicyName: "AthenaPolicy"
+          PolicyDocument: {
+            "Version": "2012-10-17",
+            "Statement": {
+              "Effect": "Allow",
+              "Action": [
+                "athena:*"
+              ],
+              "Resource": "*"
+            }
+          }
+      Tags:
+        - Key: "Resource"
+          Value: "extra"
+
+  experimentsinstanceprofile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref experimentsiamrole
