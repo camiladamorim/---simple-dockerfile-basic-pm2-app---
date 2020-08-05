@@ -1,14 +1,11 @@
-## bs2b
+simple dockerfile to run express and pm2 in aws 
 
-
-
-
-### obter imagem a partir do dockerfile(buildar):
+### 1
 > docker build -t app .   
 
-### obter container a partir da imagem (rodar):
+### 2
 docker run -it -p 7000:7000 app
 
-### abrir navegador em
+### 3
 . http://localhost:7000/call
 . http://localhost:7000/
